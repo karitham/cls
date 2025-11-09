@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	chroma "github.com/amikos-tech/chroma-go/pkg/api/v2"
 	"github.com/amikos-tech/chroma-go/pkg/embeddings"
 	ollama "github.com/amikos-tech/chroma-go/pkg/embeddings/ollama"
+	"golang.org/x/sync/errgroup"
 )
 
 type FileData struct {
@@ -33,7 +35,7 @@ type ChromaClient interface {
 	Close() error
 }
 type Collection interface {
-	AddDocuments(ctx context.Context, ids []string, documents []string, metadatas []FileMetadata) error
+	AddDocuments(ctx context.Context, paths []string) error
 	Query(ctx context.Context, query string, n int) ([]QueryResult, error)
 }
 type chromaClientImpl struct {
@@ -97,8 +99,8 @@ type collectionImpl struct {
 	logger *slog.Logger
 }
 
-func (c *collectionImpl) AddDocuments(ctx context.Context, ids []string, documents []string, metadatas []FileMetadata) error {
-	return BatchAddDocuments(ctx, c.coll, ids, documents, metadatas, c.logger)
+func (c *collectionImpl) AddDocuments(ctx context.Context, paths []string) error {
+	return BatchAddDocuments(ctx, c.coll, paths, c.logger)
 }
 
 func (c *collectionImpl) Query(ctx context.Context, query string, n int) ([]QueryResult, error) {
@@ -137,42 +139,46 @@ func (c *collectionImpl) Query(ctx context.Context, query string, n int) ([]Quer
 
 	return queryResults, nil
 }
-func BatchAddDocuments(ctx context.Context, coll chroma.Collection, ids []string, documents []string, metadatas []FileMetadata, logger *slog.Logger) error {
-	if len(ids) != len(documents) || len(ids) != len(metadatas) {
-		return fmt.Errorf("ids, documents, and metadatas must have the same length")
-	}
-
-	if len(ids) == 0 {
+func BatchAddDocuments(ctx context.Context, coll chroma.Collection, paths []string, logger *slog.Logger) error {
+	if len(paths) == 0 {
 		return nil
 	}
-	documentIDs := make([]chroma.DocumentID, len(ids))
-	for i, id := range ids {
-		documentIDs[i] = chroma.DocumentID(id)
-	}
 
-	chromaMetadatas := make([]chroma.DocumentMetadata, len(metadatas))
-	for i, meta := range metadatas {
-		chromaMetadatas[i] = chroma.NewDocumentMetadata(
-			chroma.NewStringAttribute("filename", meta.Filename),
-			chroma.NewStringAttribute("path", meta.Path),
-			chroma.NewIntAttribute("size", meta.Size),
-		)
-	}
+	group, _ := errgroup.WithContext(ctx)
+	group.SetLimit(50)
+
 	batchSize := 100
-	for i := 0; i < len(documentIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(documentIDs) {
-			end = len(documentIDs)
-		}
+	for i := 0; i < len(paths); i += batchSize {
+		paths := paths[i:max(i+batchSize, len(paths))]
 
-		err := coll.Add(ctx,
-			chroma.WithIDs(documentIDs[i:end]...),
-			chroma.WithTexts(documents[i:end]...),
-			chroma.WithMetadatas(chromaMetadatas[i:end]...))
-		if err != nil {
-			return fmt.Errorf("failed to add documents batch %d-%d to collection: %w", i, end-1, err)
-		}
+		group.Go(func() error {
+			var (
+				docsMeta    = make([]chroma.DocumentMetadata, len(paths))
+				docIDs      = make([]chroma.DocumentID, len(paths))
+				docContents = make([]string, len(paths))
+			)
+			for i, p := range paths {
+				data, err := os.ReadFile(p)
+				if err != nil {
+					continue
+				}
+
+				docsMeta[i] = chroma.NewDocumentMetadata(chroma.NewStringAttribute("path", string(p)))
+				docIDs[i] = chroma.DocumentID(p)
+				docContents[i] = string(data)
+			}
+
+			err := coll.Add(ctx,
+				chroma.WithIDs(docIDs...),
+				chroma.WithTexts(docContents...),
+				chroma.WithMetadatas(docsMeta...))
+			if err != nil {
+				return fmt.Errorf("failed to add documents to collection: %w", err)
+			}
+
+			return nil
+		})
 	}
 
-	return nil
+	return group.Wait()
 }

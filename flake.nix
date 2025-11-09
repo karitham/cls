@@ -13,6 +13,7 @@
             pkgs.gcc
             pkgs.python3Packages.chromadb
             pkgs.ollama
+            pkgs.opencode
           ];
         };
       }

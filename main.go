@@ -4,135 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/karitham/cls/dirextractor"
 )
-
-func collectFiles(targetPath string, logger *slog.Logger) ([]FileData, error) {
-	var files []FileData
-	ignorePatterns := readGitignore(targetPath)
-	validExtensions := map[string]bool{
-		".txt":        true,
-		".md":         true,
-		".go":         true,
-		".py":         true,
-		".js":         true,
-		".ts":         true,
-		".json":       true,
-		".yaml":       true,
-		".yml":        true,
-		".xml":        true,
-		".html":       true,
-		".css":        true,
-		".sh":         true,
-		".rs":         true,
-		".java":       true,
-		".c":          true,
-		".cpp":        true,
-		".h":          true,
-		".hpp":        true,
-		".sql":        true,
-		".dockerfile": true,
-		".gitignore":  true,
-		".toml":       true,
-		".ini":        true,
-		".cfg":        true,
-		".conf":       true,
-		".nix":        true,
-	}
-
-	err := filepath.Walk(targetPath, func(path string, info fs.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		relPath, err := filepath.Rel(targetPath, path)
-		if err != nil {
-			return err
-		}
-		if info.IsDir() && (info.Name() == "node_modules" || info.Name() == ".git") {
-			return filepath.SkipDir
-		}
-		if shouldIgnore(relPath, ignorePatterns) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() || strings.HasPrefix(info.Name(), ".") {
-			if info.IsDir() && strings.HasPrefix(info.Name(), ".") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if !validExtensions[ext] {
-			return nil
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			logger.Warn("could not read file", "path", path, "error", err)
-			return nil
-		}
-
-		files = append(files, FileData{
-			Path:    path,
-			Name:    info.Name(),
-			Content: string(content),
-			Size:    info.Size(),
-		})
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("error walking filepath: %w", err)
-	}
-
-	return files, nil
-}
-func readGitignore(targetPath string) []string {
-	gitignorePath := filepath.Join(targetPath, ".gitignore")
-	content, err := os.ReadFile(gitignorePath)
-	if err != nil {
-		return []string{}
-	}
-
-	var patterns []string
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		patterns = append(patterns, line)
-	}
-	return patterns
-}
-func shouldIgnore(relPath string, patterns []string) bool {
-	for _, pattern := range patterns {
-		if matchesPattern(relPath, pattern) {
-			return true
-		}
-	}
-	return false
-}
-func matchesPattern(path, pattern string) bool {
-	if strings.HasSuffix(pattern, "/") {
-		pattern = strings.TrimSuffix(pattern, "/")
-		return strings.HasPrefix(path, pattern+"/") || path == pattern
-	}
-	if strings.Contains(pattern, "*") {
-		parts := strings.Split(pattern, "*")
-		if len(parts) == 2 {
-			return strings.HasPrefix(path, parts[0]) && strings.HasSuffix(path, parts[1])
-		}
-	}
-	return path == pattern || strings.HasPrefix(path, pattern+"/")
-}
 
 func main() {
 	var (
@@ -196,33 +74,14 @@ func indexFile(chromaURL, collection, targetPath string, logger *slog.Logger) {
 		os.Exit(1)
 	}
 
-	files, err := collectFiles(targetPath, logger)
-	if err != nil {
-		logger.Error("Failed to collect files", "error", err)
-		os.Exit(1)
-	}
+	files := slices.Collect(dirextractor.New(
+		targetPath,
+		dirextractor.WithExtensions(dirextractor.DefaultExtractionExtensions),
+		dirextractor.WithIgnoreHidden(),
+		dirextractor.WithIgnoreRegs(".*node_modules.*"),
+	).Files())
 
-	if len(files) == 0 {
-		fmt.Println("No files found to index")
-		return
-	}
-
-	var documents []string
-	var ids []string
-	var metadatas []FileMetadata
-
-	for _, file := range files {
-		fmt.Printf("Indexing: %s\n", file.Path)
-		documents = append(documents, file.Content)
-		ids = append(ids, strings.ReplaceAll(file.Path, "/", "_"))
-		metadatas = append(metadatas, FileMetadata{
-			Filename: file.Name,
-			Path:     file.Path,
-			Size:     file.Size,
-		})
-	}
-
-	err = coll.AddDocuments(ctx, ids, documents, metadatas)
+	err = coll.AddDocuments(ctx, files)
 	if err != nil {
 		logger.Error("Failed to add documents to collection", "error", err)
 		os.Exit(1)
@@ -256,18 +115,6 @@ func queryDB(chromaURL, collection, query string, logger *slog.Logger) {
 	}
 	defer client.Close()
 
-	coll, err = client.GetCollection(ctx, collection)
-	if err != nil {
-		logger.Error("Failed to get collection", "error", err)
-		os.Exit(1)
-	}
-
-	results, err = coll.Query(ctx, query, 5)
-	if err != nil {
-		logger.Error("Failed to query collection", "error", err)
-		os.Exit(1)
-	}
-
 	if len(results) == 0 {
 		fmt.Println("No results found")
 		return
@@ -289,13 +136,6 @@ func deleteCollection(chromaURL, collection string, logger *slog.Logger) {
 	client, err := NewChromaClient(chromaURL, logger)
 	if err != nil {
 		logger.Error("Failed to create ChromaDB client", "error", err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
-	err = client.DeleteCollection(ctx, collection)
-	if err != nil {
-		logger.Error("Failed to delete collection", "error", err)
 		os.Exit(1)
 	}
 	defer client.Close()
